@@ -127,6 +127,10 @@ type ReadOpts struct {
 
 	// InRowNumber indicates whether to add a row number column.
 	InRowNumber bool
+
+	// InProvenance indicates whether to append source provenance columns
+	// (file, physical line, logical table) to every imported row.
+	InProvenance bool
 }
 
 // NewReadOpts returns a ReadOpts.
@@ -224,6 +228,16 @@ func IsTemporary(t bool) ReadOpt {
 func InRowNumber(t bool) ReadOpt {
 	return func(args *ReadOpts) {
 		args.InRowNumber = t
+	}
+}
+
+// InProvenance enables source provenance columns on import.
+// Each imported row gains columns identifying the source file,
+// the physical line range the record occupies in that file, and
+// the logical table named in the SQL statement.
+func InProvenance(t bool) ReadOpt {
+	return func(args *ReadOpts) {
+		args.InProvenance = t
 	}
 }
 

@@ -14,15 +14,17 @@ import (
 
 // YAMLReader parses YAML documents as tabular input.
 type YAMLReader struct {
-	reader    *yaml.Decoder
-	query     *gojq.Query
-	already   map[string]bool
-	inNULL    string
-	preRead   []map[string]any
-	names     []string
-	types     []string
-	limitRead bool
-	needNULL  bool
+	splitter   *yamlDocSplitter
+	query      *gojq.Query
+	already    map[string]bool
+	inNULL     string
+	preRead    []map[string]any
+	preReadPos []rowPosition
+	names      []string
+	types      []string
+	limitRead  bool
+	needNULL   bool
+	lastPos    rowPosition
 }
 
 // NewYAMLReader returns a YAMLReader configured with input options and jq filter.
@@ -35,7 +37,7 @@ func NewYAMLReader(reader io.Reader, opts *ReadOpts) (*YAMLReader, error) {
 	}
 	r.query = query
 
-	r.reader = yaml.NewDecoder(reader)
+	r.splitter = newYAMLDocSplitter(reader)
 	r.already = make(map[string]bool)
 
 	if err := r.yamlParse(opts); err != nil {
@@ -45,34 +47,67 @@ func NewYAMLReader(reader io.Reader, opts *ReadOpts) (*YAMLReader, error) {
 	return r, nil
 }
 
+// decodeDocument parses one YAML document into a generic value.
+func (r *YAMLReader) decodeDocument(doc yamlDocument) (any, error) {
+	var top any
+	if err := yaml.Unmarshal(doc.data, &top); err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrInvalidYAML, err)
+	}
+	return top, nil
+}
+
 // yamlParse parses YAML and stores it in preRead.
 func (r *YAMLReader) yamlParse(opts *ReadOpts) error {
 	r.limitRead = opts.InLimitRead
 	r.needNULL = opts.InNeedNULL
 	r.inNULL = opts.InNULL
 
-	var top any
+	if err := r.splitter.preload(); err != nil {
+		return err
+	}
+
 	for i := 0; i < opts.InPreRead; i++ {
-		if err := r.reader.Decode(&top); err != nil {
+		doc, err := r.splitter.next()
+		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				return fmt.Errorf("%w: %s", ErrInvalidYAML, err)
 			}
 			debug.Print(err.Error())
 			return nil
 		}
+		top, err := r.decodeDocument(doc)
+		if err != nil {
+			return err
+		}
+		r.lastPos = rowPosition{line: doc.startLn, lineEnd: doc.endLn}
 
 		if r.query != nil {
 			if err := r.jquery(top); err != nil {
 				return err
 			}
+			r.markPreReadPosition()
 			return nil
 		}
 
 		if err := r.readAhead(top); err != nil {
 			return err
 		}
+		r.markPreReadPosition()
 	}
 	return nil
+}
+
+// markPreReadPosition attaches the current document's physical span to all
+// rows buffered during the most recent readAhead call.
+func (r *YAMLReader) markPreReadPosition() {
+	for len(r.preReadPos) < len(r.preRead) {
+		r.preReadPos = append(r.preReadPos, r.lastPos)
+	}
+}
+
+// RowPosition returns the physical line range of the last decoded document.
+func (r *YAMLReader) RowPosition() rowPosition {
+	return r.lastPos
 }
 
 // jquery parses the top level of the YAML and stores it in preRead.
@@ -181,6 +216,21 @@ func (r *YAMLReader) PreReadRow() [][]any {
 	return rows
 }
 
+// PreReadRowWithPosition returns the pre-read rows paired with the physical
+// line span of the document each row came from.
+func (r *YAMLReader) PreReadRowWithPosition() []positionedRow {
+	rows := r.PreReadRow()
+	out := make([]positionedRow, len(rows))
+	for n := range rows {
+		pos := r.lastPos
+		if n < len(r.preReadPos) {
+			pos = r.preReadPos[n]
+		}
+		out[n] = positionedRow{row: rows[n], pos: pos}
+	}
+	return out
+}
+
 // ReadRow reads the rest of the row.
 // Only YAMLl requires ReadRow in YAML.
 func (r *YAMLReader) ReadRow(row []any) ([]any, error) {
@@ -188,12 +238,16 @@ func (r *YAMLReader) ReadRow(row []any) ([]any, error) {
 		return nil, io.EOF
 	}
 
-	var data any
-	if err := r.reader.Decode(&data); err != nil {
+	doc, err := r.splitter.next()
+	if err != nil {
 		return nil, err
 	}
-	v := r.rowParse(row, data)
-	return v, nil
+	data, err := r.decodeDocument(doc)
+	if err != nil {
+		return nil, err
+	}
+	r.lastPos = rowPosition{line: doc.startLn, lineEnd: doc.endLn}
+	return r.rowParse(row, data), nil
 }
 
 func (r *YAMLReader) rowParse(row []any, yamlRow any) []any {

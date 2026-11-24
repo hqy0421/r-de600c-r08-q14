@@ -19,6 +19,8 @@ type LogfmtReader struct {
 	types     []string
 	limitRead bool
 	needNULL  bool
+	lastPos   rowPosition
+	lineNumberReader
 }
 
 // NewLogfmtReader returns a LogfmtReader configured with input options.
@@ -126,21 +128,30 @@ func (r *LogfmtReader) read() (map[string]string, []string, error) {
 
 func (r *LogfmtReader) readline() (string, error) {
 	var builder strings.Builder
+	startLine := r.beginLine()
 	for {
 		line, isPrefix, err := r.reader.ReadLine()
 		if err != nil {
 			return "", err
 		}
 		builder.Write(line)
+		r.consumeLine()
 		if isPrefix {
 			continue
 		}
+		r.lastPos = r.finishRecord(startLine)
 		str := strings.TrimSpace(builder.String())
 		if len(str) != 0 {
 			return str, nil
 		}
 		builder.Reset()
+		startLine = r.beginLine()
 	}
+}
+
+// RowPosition returns the physical line range of the last read record.
+func (r *LogfmtReader) RowPosition() rowPosition {
+	return r.lastPos
 }
 
 // parseLogfmt parses a single logfmt line into ordered keys and their values.

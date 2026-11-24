@@ -13,27 +13,32 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sort"
 
 	"github.com/itchyny/gojq"
 )
 
 // JSONReader parses JSON objects and arrays as tabular input.
 type JSONReader struct {
-	reader    *json.Decoder
-	query     *gojq.Query
-	already   map[string]bool
-	inNULL    string
-	preRead   []map[string]any
-	names     []string
-	types     []string
-	limitRead bool
-	needNULL  bool
+	reader     *json.Decoder
+	query      *gojq.Query
+	already    map[string]bool
+	inNULL     string
+	preRead    []map[string]any
+	preReadPos []rowPosition
+	names      []string
+	types      []string
+	limitRead  bool
+	needNULL   bool
+	lastPos    rowPosition
+	*offsetLineReader
 }
 
 // NewJSONReader returns a JSONReader configured with input options and jq filter.
 func NewJSONReader(reader io.Reader, opts *ReadOpts) (*JSONReader, error) {
 	r := &JSONReader{}
-	r.reader = json.NewDecoder(reader)
+	r.offsetLineReader = newOffsetLineReader(reader)
+	r.reader = json.NewDecoder(r.offsetLineReader)
 	r.reader.UseNumber()
 	r.already = make(map[string]bool)
 	var top any
@@ -51,6 +56,7 @@ func NewJSONReader(reader io.Reader, opts *ReadOpts) (*JSONReader, error) {
 	r.inNULL = opts.InNULL
 
 	for i := 0; i < opts.InPreRead; i++ {
+		startOffset := r.reader.InputOffset()
 		if err := r.reader.Decode(&top); err != nil {
 			if !errors.Is(err, io.EOF) {
 				return r, fmt.Errorf("%w: %s", ErrInvalidJSON, err)
@@ -58,20 +64,84 @@ func NewJSONReader(reader io.Reader, opts *ReadOpts) (*JSONReader, error) {
 			debug.Print(err.Error())
 			return r, nil
 		}
+		r.trackDoc(startOffset, r.reader.InputOffset())
 
 		if r.query != nil {
 			if err := r.jqueryRun(top); err != nil {
 				return nil, err
 			}
+			r.markPreReadPosition()
 			return r, nil
 		}
 
 		if err := r.readAhead(top); err != nil {
 			return nil, err
 		}
+		r.markPreReadPosition()
 	}
 
 	return r, nil
+}
+
+// trackDoc records the physical line span of the JSON document occupying
+// byte range [startOffset, endOffset). Rows expanded from one document (a
+// JSON array or a jq result) inherit the document's span; JSONL documents
+// occupy one line each.
+func (r *JSONReader) trackDoc(startOffset, endOffset int64) {
+	startLine := r.contentStartLine(startOffset)
+	// The end offset is the first byte after the document. When it is the
+	// newline terminating the last record line, the document ends on the
+	// current line; when it starts the next line already, use that offset.
+	endLine := r.lineAt(endOffset)
+	if endLine > startLine && r.isLineStart(endOffset) {
+		endLine--
+	}
+	r.lastPos = rowPosition{line: startLine, lineEnd: endLine}
+	// Prune only after lookups: the entry at startOffset itself is needed.
+	r.pruneBefore(startOffset + 1)
+}
+
+// contentStartLine resolves the physical line where document content
+// begins. The decoder's start offset may sit inside the whitespace gap
+// between top-level documents; every line terminator in that gap produces a
+// consecutive line-start entry, so walk the run of entries whose offsets
+// advance one byte at a time from startOffset. The last entry in the run is
+// the start of the first content line.
+func (r *JSONReader) contentStartLine(startOffset int64) int {
+	if startOffset == 0 || !r.isLineStart(startOffset) && !r.isLineStart(startOffset+1) && !r.isLineStart(startOffset+2) {
+		return r.lineAt(startOffset)
+	}
+	// Locate the first entry at or after startOffset.
+	idx := sort.Search(len(r.entries), func(i int) bool {
+		return r.entries[i].offset >= startOffset
+	})
+	want := startOffset
+	line := r.lineAt(startOffset)
+	for j := idx; j < len(r.entries); j++ {
+		if r.entries[j].offset != want+1 {
+			break
+		}
+		want++
+		line = r.entries[j].lineNo
+	}
+	if line == r.lineAt(startOffset) && r.isLineStart(startOffset) {
+		// startOffset itself begins a line (JSONL without preceding gap).
+		line++
+	}
+	return line
+}
+
+// markPreReadPosition attaches the current document's physical span to all
+// rows buffered during the most recent readAhead call.
+func (r *JSONReader) markPreReadPosition() {
+	for len(r.preReadPos) < len(r.preRead) {
+		r.preReadPos = append(r.preReadPos, r.lastPos)
+	}
+}
+
+// RowPosition returns the physical line range of the last decoded document.
+func (r *JSONReader) RowPosition() rowPosition {
+	return r.lastPos
 }
 
 // jqParse parses a string and returns a *gojq.Query.
@@ -174,6 +244,21 @@ func (r *JSONReader) PreReadRow() [][]any {
 	return rows
 }
 
+// PreReadRowWithPosition returns the pre-read rows paired with the physical
+// line span of the document each row came from.
+func (r *JSONReader) PreReadRowWithPosition() []positionedRow {
+	rows := r.PreReadRow()
+	out := make([]positionedRow, len(rows))
+	for n := range rows {
+		pos := r.lastPos
+		if n < len(r.preReadPos) {
+			pos = r.preReadPos[n]
+		}
+		out[n] = positionedRow{row: rows[n], pos: pos}
+	}
+	return out
+}
+
 // ReadRow reads the rest of the row.
 // Only jsonl requires ReadRow in json.
 func (r *JSONReader) ReadRow(row []any) ([]any, error) {
@@ -182,9 +267,11 @@ func (r *JSONReader) ReadRow(row []any) ([]any, error) {
 	}
 
 	var data any
+	startOffset := r.reader.InputOffset()
 	if err := r.reader.Decode(&data); err != nil {
 		return nil, err
 	}
+	r.trackDoc(startOffset, r.reader.InputOffset())
 
 	if r.query != nil {
 		return r.jqueryRunJsonl(row, data)

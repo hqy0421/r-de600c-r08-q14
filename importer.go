@@ -233,6 +233,13 @@ func ImportFile(db *DB, fileName string, readOpts *ReadOpts) (string, error) {
 // Wildcards can be passed as fileName.
 func ImportFileContext(ctx context.Context, db *DB, fileName string, readOpts *ReadOpts) (string, error) {
 	opts, fileName := GuessOpts(readOpts, fileName)
+
+	// With provenance enabled each expanded file is imported separately so
+	// that its physical lines and source file identity are preserved.
+	if opts.InProvenance {
+		return importProvenanceContext(ctx, db, fileName, opts)
+	}
+
 	db.importCount++
 	file, err := importFileOpen(fileName)
 	if err != nil {
@@ -283,6 +290,167 @@ func ImportFileContext(ctx context.Context, db *DB, fileName string, readOpts *R
 	}
 
 	return tableName, db.ImportContext(ctx, tableName, columnNames, reader)
+}
+
+// resolveSourceFiles expands a table reference into the concrete files to
+// import. A glob pattern is expanded with filepath.Glob; an ordinary path
+// (including stdin) is returned unchanged. A glob with no match returns
+// ErrNoMatchFound.
+func resolveSourceFiles(fileName string) ([]string, error) {
+	if r := regexp.MustCompile(`\*|\?|\[`); r.MatchString(fileName) {
+		expanded := expandTilde(trimQuote(fileName))
+		matches, err := filepath.Glob(expanded)
+		if err != nil {
+			return nil, err
+		}
+		if len(matches) == 0 {
+			return nil, fmt.Errorf("%w: %s", ErrNoMatchFound, expanded)
+		}
+		return matches, nil
+	}
+	return []string{fileName}, nil
+}
+
+// importProvenanceContext imports one table reference with source
+// provenance. When the reference is a glob, every matched file is imported
+// separately into the same table, keeping each row's concrete source file
+// and physical line numbers. The logical table name (the reference as
+// written in the SQL statement) is identical across all expanded files.
+func importProvenanceContext(ctx context.Context, db *DB, fileName string, opts *ReadOpts) (string, error) {
+	files, err := resolveSourceFiles(fileName)
+	if err != nil {
+		debug.Printf("%s\n", err)
+		return "", nil
+	}
+
+	logicalTable := fileName
+	tableName := logicalTable
+	if opts.InJQuery != "" {
+		db.importCount++
+		tableName = fmt.Sprintf("%s::jq%d", logicalTable, db.importCount)
+	}
+	quotedTableName := db.QuotedName(tableName)
+
+	// Build one reader per concrete file, each carrying its own source
+	// identity, then chain them through a single multiFileReader so the
+	// whole import shares one prepared statement and row buffer.
+	readers := make([]Reader, 0, len(files))
+	provReaders := make([]*provenanceReader, 0, len(files))
+	closers := make([]io.Closer, 0, len(files))
+	var columnNames []string
+	var columnTypes []string
+	dataWidth := 0
+	for _, sourceFile := range files {
+		reader, provReader, closer, names, types, err := openProvenanceReader(logicalTable, sourceFile, opts)
+		if err != nil {
+			for _, c := range closers {
+				_ = c.Close()
+			}
+			return quotedTableName, err
+		}
+		if reader == nil {
+			continue
+		}
+		if len(columnNames) == 0 {
+			columnNames = names
+			columnTypes = types
+			if inner, err := provReader.reader.Names(); err == nil {
+				dataWidth = len(inner)
+			} else {
+				dataWidth = len(names) - provenanceColumnCount
+			}
+		}
+		readers = append(readers, reader)
+		if provReader != nil {
+			provReaders = append(provReaders, provReader)
+		}
+		if closer != nil {
+			closers = append(closers, closer)
+		}
+	}
+
+	if len(columnNames) == 0 {
+		debug.Printf("no importable rows for [%s]", fileName)
+		for _, c := range closers {
+			_ = c.Close()
+		}
+		return quotedTableName, nil
+	}
+
+	// Pin every file to the first file's data width so every row fits the
+	// table created from that schema. Wider files lose their surplus
+	// columns and narrower files are nil-padded; the four provenance
+	// columns (and any leading row-number column) are unaffected.
+	for _, pr := range provReaders {
+		pr.setDataWidth(dataWidth)
+	}
+
+	if err := db.CreateTableContext(ctx, quotedTableName, columnNames, columnTypes, opts.IsTemporary); err != nil {
+		for _, c := range closers {
+			_ = c.Close()
+		}
+		return quotedTableName, err
+	}
+
+	reader := newMultiFileReader(readers, closers...)
+	return quotedTableName, db.ImportContext(ctx, quotedTableName, columnNames, reader)
+}
+
+// openProvenanceReader opens one concrete file and returns a reader already
+// wrapped with provenance (and optional row number) columns, together with
+// the underlying provenance wrapper and the file handle to close. A missing
+// or empty file yields a nil reader without error so that other files
+// expanded from the same glob are still imported.
+func openProvenanceReader(logicalTable, sourceFile string, opts *ReadOpts) (Reader, *provenanceReader, io.Closer, []string, []string, error) {
+	file, err := singleFileOpen(sourceFile)
+	if err != nil {
+		debug.Printf("%s\n", err)
+		return nil, nil, nil, nil, nil, nil
+	}
+
+	fileOpts := *opts
+	guessOpts, concreteName := GuessOpts(&fileOpts, sourceFile)
+
+	reader, err := NewReader(file, guessOpts)
+	if err != nil {
+		file.Close()
+		return nil, nil, nil, nil, nil, err
+	}
+
+	// Provenance columns first, then the optional global row number.
+	provReader := newProvenanceReader(reader, provenanceFileName(concreteName), logicalTable)
+	reader = Reader(provReader)
+	if guessOpts.InRowNumber {
+		reader = newRowNumberReader(reader)
+	}
+
+	names, err := reader.Names()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			debug.Printf("EOF reached before argument number of rows: %s", concreteName)
+			file.Close()
+			return nil, nil, nil, nil, nil, nil
+		}
+		file.Close()
+		return nil, nil, nil, nil, nil, err
+	}
+	types, err := reader.Types()
+	if err != nil {
+		file.Close()
+		return nil, nil, nil, nil, nil, err
+	}
+	debug.Printf("Column Names: [%v]", strings.Join(names, ","))
+	debug.Printf("Column Types: [%v]", strings.Join(types, ","))
+	return reader, provReader, file, names, types, nil
+}
+
+// provenanceFileName returns the value stored in the source file column.
+// stdin is normalized to "-" regardless of how it was referenced.
+func provenanceFileName(fileName string) string {
+	if fileName == "" || strings.ToLower(fileName) == "stdin" {
+		return "-"
+	}
+	return fileName
 }
 
 // GuessOpts guesses ReadOpts from the file name and sets it.

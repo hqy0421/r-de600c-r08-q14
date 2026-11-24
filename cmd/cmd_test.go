@@ -508,6 +508,44 @@ func TestCli_Run(t *testing.T) {
 	}
 }
 
+func TestCli_Run_Provenance(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "csvProvenance",
+			args: []string{"trdsql", "-iprovenance",
+				"SELECT " + trdsql.ProvenanceLineColumn + " FROM " +
+					filepath.Join("..", "testdata", "test.csv")},
+			want: "1\n2\n3\n",
+		},
+		{
+			name: "globProvenance",
+			args: []string{"trdsql", "-iprovenance",
+				"SELECT " + trdsql.ProvenanceFileColumn + " FROM " +
+					filepath.Join("..", "testdata", "tt*.csv") +
+					" ORDER BY " + trdsql.ProvenanceFileColumn},
+			want: filepath.Join("..", "testdata", "tt1.csv") + "\n" +
+				filepath.Join("..", "testdata", "tt2.csv") + "\n" +
+				filepath.Join("..", "testdata", "tt3.csv") + "\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outStream, errStream := new(bytes.Buffer), new(bytes.Buffer)
+			cli := Cli{OutStream: outStream, ErrStream: errStream}
+			if got := cli.Run(tt.args); got != 0 {
+				t.Fatalf("Run() = %v: %s", got, errStream.String())
+			}
+			if outStream.String() != tt.want {
+				t.Errorf("output = %q, want %q", outStream.String(), tt.want)
+			}
+		})
+	}
+}
+
 func TestCli_Run_Out(t *testing.T) {
 	tests := []struct {
 		name string

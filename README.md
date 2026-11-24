@@ -55,9 +55,10 @@ For usage as a library, please refer to the [godoc](https://pkg.go.dev/github.co
   * 4.14. [WIDTH](#width)
   * 4.15. [TEXT](#text)
   * 4.16. [logfmt](#logfmt)
-  * 4.17. [Raw output](#raw-output)
-  * 4.18. [ASCII Table & MarkDown output](#ascii-table-&-markdown-output)
-  * 4.19. [Vertical format output](#vertical-format-output)
+  * 4.17. [Source provenance](#source-provenance)
+  * 4.18. [Raw output](#raw-output)
+  * 4.19. [ASCII Table & MarkDown output](#ascii-table-&-markdown-output)
+  * 4.20. [Vertical format output](#vertical-format-output)
 * 5. [SQL](#sql)
   * 5.1. [SQL function](#sql-function)
   * 5.2. [JOIN](#join)
@@ -200,6 +201,7 @@ trdsql -o[output format] -t [input filename]
 * `-ilr` **int** limited number of rows to read.
 * `-inull` **string** value(string) to convert to null on input.
 * `-inum` add row number column.
+* `-iprovenance` add source provenance columns (file, physical line, logical table).
 * `-ir` **int** number of rows to preread. (default 1)
 * `-is` **int** skip header row.
 
@@ -866,7 +868,56 @@ info,200,request done
 The columns are taken from the keys in the first row (use `-ir` to preread more rows when
 later lines add keys). A key with no `=` (a bare flag) is read as an empty value.
 
-###  4.17. <a name='raw-output'></a>Raw output
+###  4.17. <a name='source-provenance'></a>Source provenance
+
+The `-iprovenance` option appends four columns to every imported row so an
+auditor can trace an aggregate result back to the exact source lines it came
+from:
+
+| column | meaning |
+| --- | --- |
+| `trdsql_file` | concrete source file name (the individual file after glob expansion, or `-` for stdin) |
+| `trdsql_line` | 1-based physical line where the record starts |
+| `trdsql_line_end` | 1-based physical line where the record ends (larger than `trdsql_line` for records spanning quoted newlines) |
+| `trdsql_table` | logical table identity: the table name as written in the SQL statement |
+
+The columns are ordinary database columns, so they work directly in `WHERE`,
+`GROUP BY` and joins. Business queries that do not select them are unaffected.
+
+When a glob expands to several files, every file is read separately: rows keep
+their own source file and physical line numbers even when several files contain
+the same sequence, and all rows share the glob expression as their logical
+table identity.
+
+```console
+$ trdsql -iprovenance -oh \
+    "SELECT trdsql_file, count(*) FROM tt*.csv GROUP BY trdsql_file"
+trdsql_file,count(*)
+tt1.csv,3
+tt2.csv,3
+tt3.csv,3
+```
+
+A multi-line quoted record is located by its full physical line range, not just
+the line where it begins:
+
+```console
+$ trdsql -icsv -iprovenance "SELECT c1, trdsql_line, trdsql_line_end FROM multi.csv"
+1,1,1
+2,2,2
+3,3,3
+4,4,5
+```
+
+Physical line numbers refer to the decompressed stream, so they match the
+imported file even when it is delivered compressed (`.gz`, `.zstd`, …) or via
+stdin. Formats whose parser buffers the whole stream before producing rows
+(TBLN, fixed-width `-iwidth`) report the record sequence number as a best
+effort. If an input already contains a column named like one of the provenance
+columns, the appended column is given a numeric suffix (e.g. `trdsql_file2`) so
+both remain addressable.
+
+###  4.18. <a name='raw-output'></a>Raw output
 
 `-oraw` is Raw Output.
 It is used when "escape processing is unnecessary" in CSV output.
@@ -891,7 +942,7 @@ $ trdsql -oraw -od "\t|\t" -db pdb "SELECT * FROM test.csv"
 3	|	Apple
 ```
 
-###  4.18. <a name='ascii-table-&-markdown-output'></a>ASCII Table & MarkDown output
+###  4.19. <a name='ascii-table-&-markdown-output'></a>ASCII Table & MarkDown output
 
 `-oat` is ASCII table output.
 
@@ -919,7 +970,7 @@ $ trdsql -omd "SELECT * FROM test.csv"
 
 The `-onowrap` option does not wrap long columns in `at` or `md` output.
 
-###  4.19. <a name='vertical-format-output'></a>Vertical format output
+###  4.20. <a name='vertical-format-output'></a>Vertical format output
 
 `-ovf` is Vertical format output("column name | value" vertically).
 

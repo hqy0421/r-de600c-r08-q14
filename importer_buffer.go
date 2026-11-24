@@ -9,6 +9,7 @@ import (
 type BufferImporter struct {
 	Reader
 	tableName string
+	readOpts  *ReadOpts
 }
 
 // NewBufferImporter returns a BufferImporter.
@@ -22,6 +23,7 @@ func NewBufferImporter(tableName string, r io.Reader, options ...ReadOpt) (*Buff
 	return &BufferImporter{
 		tableName: tableName,
 		Reader:    reader,
+		readOpts:  readOpts,
 	}, nil
 }
 
@@ -32,17 +34,23 @@ func (i *BufferImporter) Import(db *DB, query string) (string, error) {
 }
 
 // ImportContext imports data from Reader in BufferImporter with context.
+// When provenance is enabled via options, source columns are appended using
+// the buffer's table name as both source file and logical table.
 func (i *BufferImporter) ImportContext(ctx context.Context, db *DB, query string) (string, error) {
-	names, err := i.Names()
+	reader := Reader(i.Reader)
+	if i.readOpts != nil && i.readOpts.InProvenance {
+		reader = newProvenanceReader(reader, i.tableName, i.tableName)
+	}
+	names, err := reader.Names()
 	if err != nil {
 		return query, err
 	}
-	types, err := i.Types()
+	types, err := reader.Types()
 	if err != nil {
 		return query, err
 	}
 	if err := db.CreateTable(i.tableName, names, types, true); err != nil {
 		return query, err
 	}
-	return query, db.ImportContext(ctx, i.tableName, names, i.Reader)
+	return query, db.ImportContext(ctx, i.tableName, names, reader)
 }

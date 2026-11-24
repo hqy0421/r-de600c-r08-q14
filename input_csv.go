@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 )
 
 // CSVReader parses delimiter-separated records.
@@ -17,6 +18,9 @@ type CSVReader struct {
 	preRead   [][]string
 	limitRead bool
 	needNULL  bool
+	// lastPos records the physical line range of the most recently read
+	// record, including pre-read records and the header.
+	lastPos rowPosition
 }
 
 // NewCSVReader returns a CSVReader configured with input options.
@@ -54,6 +58,7 @@ func NewCSVReader(reader io.Reader, opts *ReadOpts) (*CSVReader, error) {
 				return nil, err
 			}
 		}
+		r.trackRecord(row)
 		r.names = make([]string, len(row))
 		for i, col := range row {
 			r.names[i] = col
@@ -75,6 +80,7 @@ func NewCSVReader(reader io.Reader, opts *ReadOpts) (*CSVReader, error) {
 			debug.Print(err.Error())
 			return r, nil
 		}
+		r.trackRecord(row)
 		rows := make([]string, len(row))
 		for i, col := range row {
 			rows[i] = col
@@ -107,6 +113,24 @@ func (r *CSVReader) setColumnType() {
 	for i := 0; i < len(r.names); i++ {
 		r.types[i] = DefaultDBType
 	}
+}
+
+// trackRecord records the physical line range of the record just read.
+// FieldPos reports the line and column of the start of each field; the
+// record's end line is derived from the number of newlines inside quoted
+// fields, so records spanning several physical lines are located exactly.
+func (r *CSVReader) trackRecord(record []string) {
+	line, _ := r.reader.FieldPos(0)
+	end := line
+	for _, field := range record {
+		end += strings.Count(field, "\n")
+	}
+	r.lastPos = rowPosition{line: line, lineEnd: end}
+}
+
+// RowPosition returns the physical line range of the last read record.
+func (r *CSVReader) RowPosition() rowPosition {
+	return r.lastPos
 }
 
 func delimiter(sepString string) (rune, error) {
@@ -166,6 +190,7 @@ func (r *CSVReader) ReadRow(row []any) ([]any, error) {
 	if err != nil {
 		return row, err
 	}
+	r.trackRecord(record)
 	if len(row) > 0 && len(record) > len(row) {
 		debug.Printf("row has %d columns, but table schema has %d columns (extra columns truncated)", len(record), len(row))
 	}

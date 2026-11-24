@@ -74,15 +74,16 @@ func (cli Cli) Run(args []string) int {
 		onlySQL   string
 		tableName string
 
-		inFlag      inputFlag
-		inDelimiter string
-		inHeader    bool
-		inSkip      int
-		inPreRead   int
-		inJQuery    string
-		inLimitRead int
-		inNull      nilString
-		inRowNumber bool
+		inFlag       inputFlag
+		inDelimiter  string
+		inHeader     bool
+		inSkip       int
+		inPreRead    int
+		inJQuery     string
+		inLimitRead  int
+		inNull       nilString
+		inRowNumber  bool
+		inProvenance bool
 
 		outFlag         outputFlag
 		outFile         string
@@ -125,6 +126,7 @@ func (cli Cli) Run(args []string) int {
 	flags.StringVar(&inJQuery, "ijq", "", "jq expression string for input(JSON/JSONL only).")
 	flags.Var(&inNull, "inull", "value(string) to convert to null on input.")
 	flags.BoolVar(&inRowNumber, "inum", false, "add row number column.")
+	flags.BoolVar(&inProvenance, "iprovenance", false, "add source provenance columns (file, physical line, logical table).")
 
 	flags.BoolVar(&inFlag.CSV, "icsv", false, "CSV format for input.")
 	flags.BoolVar(&inFlag.LTSV, "iltsv", false, "LTSV format for input.")
@@ -252,6 +254,7 @@ func (cli Cli) Run(args []string) int {
 		trdsql.InNeedNULL(inNull.valid),
 		trdsql.InNULL(inNull.str),
 		trdsql.InRowNumber(inRowNumber),
+		trdsql.InProvenance(inProvenance),
 	)
 
 	writer := cli.OutStream

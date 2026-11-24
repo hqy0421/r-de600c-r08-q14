@@ -9,9 +9,11 @@ import (
 // TextReader provides a reader for text format.
 // TextReader reads each line as a single text column without splitting.
 type TextReader struct {
-	reader *bufio.Reader
-	num    int
-	maxNum int
+	reader  *bufio.Reader
+	num     int
+	maxNum  int
+	lastPos rowPosition
+	lineNumberReader
 }
 
 // NewTextReader returns a new TextReader.
@@ -48,6 +50,7 @@ func (r *TextReader) PreReadRow() [][]any {
 // ReadRow reads a row.
 func (r *TextReader) ReadRow([]any) ([]any, error) {
 	var builder strings.Builder
+	startLine := r.beginLine()
 	for {
 		if r.maxNum > 0 && r.num >= r.maxNum {
 			return []any{""}, io.EOF
@@ -57,10 +60,17 @@ func (r *TextReader) ReadRow([]any) ([]any, error) {
 			return []any{""}, err
 		}
 		builder.Write(line)
+		r.consumeLine()
 		if isPrefix {
 			continue
 		}
 		r.num++
+		r.lastPos = r.finishRecord(startLine)
 		return []any{builder.String()}, nil
 	}
+}
+
+// RowPosition returns the physical line range of the last read record.
+func (r *TextReader) RowPosition() rowPosition {
+	return r.lastPos
 }
